@@ -34,19 +34,14 @@ func PrintGitHubActions(w io.Writer, cs *ChangeSet, threshold string) error {
 		if f.Change.Severity != "" {
 			title = fmt.Sprintf("Kubescape %s regression: %s (%s)", f.Kind, f.Change.ControlID, f.Change.Severity)
 		}
-		msg := buildPostureAnnotationMessage(f)
-		if f.Change.Path != "" {
-			ew.printf("::error file=%s,title=%s::%s\n",
-				escapeWorkflowProperty(f.Change.Path),
-				escapeWorkflowProperty(title),
-				escapeWorkflowData(msg),
-			)
-		} else {
-			ew.printf("::error title=%s::%s\n",
-				escapeWorkflowProperty(title),
-				escapeWorkflowData(msg),
-			)
-		}
+		// ControlChange.Path is an evidence location inside the resource (a
+		// field path or a fix command), not a repository file, so it belongs
+		// in the message. Diff reports do not keep source manifest paths, so
+		// no file= property is emitted.
+		ew.printf("::error title=%s::%s\n",
+			escapeWorkflowProperty(title),
+			escapeWorkflowData(buildPostureAnnotationMessage(f)),
+		)
 	}
 
 	if len(findings) > githubActionsMaxAnnotations {
@@ -142,6 +137,22 @@ func buildPostureAnnotationMessage(f ciFinding) string {
 	}
 	if f.Change.ControlName != "" {
 		parts = append(parts, fmt.Sprintf("name=%s", f.Change.ControlName))
+	}
+	if f.Change.RuleName != "" {
+		parts = append(parts, fmt.Sprintf("rule=%s", f.Change.RuleName))
+	}
+	if f.Change.EvidenceType != "" && f.Change.EvidenceType != evidenceTypeControl {
+		parts = append(parts, fmt.Sprintf("evidence=%s", f.Change.EvidenceType))
+	}
+	if f.Change.Path != "" {
+		if f.Change.EvidenceType == evidenceTypeFixCommand {
+			parts = append(parts, fmt.Sprintf("command=%s", f.Change.Path))
+		} else {
+			parts = append(parts, fmt.Sprintf("path=%s", f.Change.Path))
+		}
+	}
+	if f.Change.EvidenceResourceID != "" && f.Change.EvidenceResourceID != f.Change.ResourceID {
+		parts = append(parts, fmt.Sprintf("evidenceResource=%s", f.Change.EvidenceResourceID))
 	}
 	if f.Change.Reason != "" {
 		parts = append(parts, fmt.Sprintf("reason=%s", f.Change.Reason))

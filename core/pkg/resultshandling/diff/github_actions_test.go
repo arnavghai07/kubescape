@@ -20,13 +20,15 @@ func TestPrintGitHubActions_Posture(t *testing.T) {
 	cs := &ChangeSet{
 		New: []ControlChange{
 			{
-				ResourceID:  "apps/v1/default/Deployment/web",
-				ControlID:   "C-0017",
-				ControlName: "Immutable container filesystem",
-				Severity:    "High",
-				BaseStatus:  "passed",
-				HeadStatus:  "failed",
-				Path:        "deploy/web,1:app.yaml",
+				ResourceID:   "apps/v1/default/Deployment/web",
+				ControlID:    "C-0017",
+				ControlName:  "Immutable container filesystem",
+				Severity:     "High",
+				BaseStatus:   "passed",
+				HeadStatus:   "failed",
+				RuleName:     "immutable-container-filesystem",
+				EvidenceType: "failedPath",
+				Path:         "spec.containers[0].securityContext.privileged",
 			},
 			{
 				ResourceID: "v1/default/Pod/low-pod",
@@ -58,8 +60,13 @@ func TestPrintGitHubActions_Posture(t *testing.T) {
 	assert.Contains(t, lines[0], "line1%0Aline2[31m")
 	assert.NotContains(t, lines[0], "\x1b")
 
-	assert.Contains(t, lines[1], "::error file=deploy/web%2C1%3Aapp.yaml,title=Kubescape new regression%3A C-0017 (High)::")
+	// The evidence path is a field inside the resource, not a repository file:
+	// it must stay out of file= and appear in the message instead.
+	assert.True(t, strings.HasPrefix(lines[1], "::error title=Kubescape new regression%3A C-0017 (High)::"), lines[1])
+	assert.NotContains(t, lines[1], "file=")
 	assert.Contains(t, lines[1], "resource=apps/v1/default/Deployment/web")
+	assert.Contains(t, lines[1], "control=C-0017; severity=High; base=passed; head=failed; name=Immutable container filesystem")
+	assert.Contains(t, lines[1], "rule=immutable-container-filesystem; evidence=failedPath; path=spec.containers[0].securityContext.privileged")
 
 	summaryBytes, err := os.ReadFile(summaryFile)
 	require.NoError(t, err)
@@ -92,6 +99,155 @@ func TestPrintGitHubActions_AnnotationCapAndTruncationWarning(t *testing.T) {
 		assert.True(t, strings.HasPrefix(lines[i], "::error "))
 	}
 	assert.Equal(t, "::warning title=Kubescape Diff::Showing 10 of 12 regressions; see the step summary or rerun with --format markdown for the full list.", lines[10])
+}
+
+// TestPrintGitHubActions_FromReports runs real posture reports through
+// ComputeWithOptions and PrintGitHubActions, so ControlChange.Path holds what
+// the evidence pipeline actually puts there (a field path in the resource).
+func TestPrintGitHubActions_FromReports(t *testing.T) {
+	t.Setenv(githubActionsStepSummaryEnvVar, "")
+
+	const report = `{
+  "results": [{
+    "resourceID": "/v1/default/Pod/web",
+    "controls": [{
+      "controlID": "C-0057",
+      "name": "Privileged container",
+      "status": {"status": %q},
+      "rules": [{"name": "rule-privilege-escalation", "status": %q%s}]
+    }]
+  }],
+  "summaryDetails": {"controls": {"C-0057": {"scoreFactor": 7}}}
+}`
+	base := writeRawReport(t, fmt.Sprintf(report, "passed", "passed", ""))
+	head := writeRawReport(t, fmt.Sprintf(report, "failed", "failed",
+		`, "paths": [{"failedPath": "spec.containers[0].securityContext.privileged", "resourceID": "/v1/default/Pod/web"}]`))
+
+	tests := []struct {
+		granularity Granularity
+		want        string
+	}{
+		{
+			granularity: GranularityEvidence,
+			want: "::error title=Kubescape new regression%3A C-0057 (High)::" +
+				"resource=/v1/default/Pod/web; control=C-0057; severity=High; base=passed; head=failed; name=Privileged container; " +
+				"rule=rule-privilege-escalation; evidence=failedPath; path=spec.containers[0].securityContext.privileged",
+		},
+		{
+			granularity: GranularityControl,
+			want: "::error title=Kubescape new regression%3A C-0057 (High)::" +
+				"resource=/v1/default/Pod/web; control=C-0057; severity=High; base=passed; head=failed; name=Privileged container",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(string(tc.granularity), func(t *testing.T) {
+			cs, err := ComputeWithOptions(base, head, Options{Granularity: tc.granularity})
+			require.NoError(t, err)
+
+			var out bytes.Buffer
+			require.NoError(t, PrintGitHubActions(&out, cs, ""))
+
+			assert.Equal(t, tc.want+"\n", out.String())
+			assert.NotContains(t, out.String(), "file=")
+		})
+	}
+}
+
+// TestPrintGitHubActions_EvidenceVariants checks that every evidence type is
+// rendered in the message (fixCommand as a command, not a path) and that
+// workflow-command metacharacters in evidence cannot break the annotation.
+func TestPrintGitHubActions_EvidenceVariants(t *testing.T) {
+	t.Setenv(githubActionsStepSummaryEnvVar, "")
+
+	tests := []struct {
+		name        string
+		change      ControlChange
+		wantTitle   string
+		wantMessage string
+		notInMsg    []string
+	}{
+		{
+			name:        "reviewPath",
+			change:      ControlChange{EvidenceType: "reviewPath", Path: "spec.serviceAccountName"},
+			wantMessage: "evidence=reviewPath; path=spec.serviceAccountName",
+		},
+		{
+			name:        "deletePath",
+			change:      ControlChange{EvidenceType: "deletePath", Path: "spec.containers[0].securityContext.capabilities.add[0]"},
+			wantMessage: "evidence=deletePath; path=spec.containers[0].securityContext.capabilities.add[0]",
+		},
+		{
+			name:        "fixPath",
+			change:      ControlChange{EvidenceType: "fixPath", Path: "spec.containers[0].securityContext.readOnlyRootFilesystem"},
+			wantMessage: "evidence=fixPath; path=spec.containers[0].securityContext.readOnlyRootFilesystem",
+		},
+		{
+			name: "fixCommand with workflow metacharacters",
+			change: ControlChange{
+				EvidenceType: "fixCommand",
+				Path:         "kubectl label ns default a=b,c:d --overwrite 100%\nkubectl get ns\x1b[0m",
+			},
+			wantMessage: "evidence=fixCommand; command=kubectl label ns default a=b,c:d --overwrite 100%25%0Akubectl get ns[0m",
+			notInMsg:    []string{"path="},
+		},
+		{
+			name: "special characters in path and control ID",
+			change: ControlChange{
+				ControlID:    "C-0001,x:y",
+				EvidenceType: "failedPath",
+				Path:         "metadata.annotations[\"a,b:c%d\"]\r\nx",
+			},
+			wantTitle:   "::error title=Kubescape new regression%3A C-0001%2Cx%3Ay (High)::",
+			wantMessage: "evidence=failedPath; path=metadata.annotations[\"a,b:c%25d\"]%0D%0Ax",
+		},
+		{
+			name: "evidence on a related resource",
+			change: ControlChange{
+				EvidenceType:       "failedPath",
+				Path:               "rules[0].verbs[0]",
+				EvidenceResourceID: "rbac.authorization.k8s.io/v1//ClusterRole/admin",
+			},
+			wantMessage: "evidence=failedPath; path=rules[0].verbs[0]; evidenceResource=rbac.authorization.k8s.io/v1//ClusterRole/admin",
+		},
+		{
+			name:        "rule evidence without a path",
+			change:      ControlChange{RuleName: "rule-a", EvidenceType: "rule"},
+			wantMessage: "rule=rule-a; evidence=rule",
+			notInMsg:    []string{"path=", "command="},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := tc.change
+			c.ResourceID = "v1/default/Pod/web"
+			if c.ControlID == "" {
+				c.ControlID = "C-0017"
+			}
+			c.Severity = "High"
+			c.BaseStatus = "passed"
+			c.HeadStatus = "failed"
+
+			var out bytes.Buffer
+			require.NoError(t, PrintGitHubActions(&out, &ChangeSet{New: []ControlChange{c}}, "High"))
+
+			got := out.String()
+			require.Equal(t, 1, strings.Count(got, "\n"), "evidence must not split the workflow command: %q", got)
+			assert.NotContains(t, got, "\r")
+			assert.NotContains(t, got, "\x1b")
+			assert.NotContains(t, got, "file=")
+
+			wantTitle := tc.wantTitle
+			if wantTitle == "" {
+				wantTitle = "::error title=Kubescape new regression%3A C-0017 (High)::"
+			}
+			require.True(t, strings.HasPrefix(got, wantTitle), got)
+			msg := strings.TrimSuffix(strings.TrimPrefix(got, wantTitle), "\n")
+			assert.Contains(t, msg, tc.wantMessage)
+			for _, s := range tc.notInMsg {
+				assert.NotContains(t, msg, s)
+			}
+		})
+	}
 }
 
 func TestPrintVulnerabilityGitHubActions(t *testing.T) {
